@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    restart: always
+    deploy:
+      replicas: 10
+    networks:
+      - social-net
+    # TEMPORARY - direct access for profiling, remove after
+    environment:
+      - DATABASE_URL=postgresql://social_admin:devpassword123@postgres:5432/social_backend
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=9a548ad229c43c0c4345ce3737400999378d29852ba8dfc42c417955e3b55a61
+      - PORT=3000
+      - POOL_MAX=8
+      - NODE_OPTIONS=--max-old-space-size=256
+    depends_on:
+      - postgres
+      - redis
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/readyz', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:16
+    networks:
+      - social-net
+    environment:
+      - POSTGRES_USER=social_admin
+      - POSTGRES_PASSWORD=devpassword123
+      - POSTGRES_DB=social_backend
+    command: postgres -c max_connections=150
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5433:5432"
+
+  redis:
+    image: redis:7
+    command: redis-server --maxmemory 512mb --maxmemory-policy volatile-lru
+    networks:
+      - social-net
+    ports:
+      - "6380:6379"
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "3000:3000"
+    networks:
+      - social-net
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  backend-worker:
+    build: .
+    command: node src/worker.js
+    restart: always
+    deploy:
+      replicas: 3
+    networks:
+      - social-net
+    environment:
+      - DATABASE_URL=postgresql://social_admin:devpassword123@postgres:5432/social_backend
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=9a548ad229c43c0c4345ce3737400999378d29852ba8dfc42c417955e3b55a61
+      - POOL_MAX=4
+      - NODE_OPTIONS=--max-old-space-size=256
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  pgdata:
+
+networks:
+  social-net:
+    driver: bridge
