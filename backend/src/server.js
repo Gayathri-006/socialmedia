@@ -5,20 +5,20 @@ const pool = require('./db');
 const redis = require('./redis');
 
 const app = express();
+
+// Enable proxy trust so Express reads X-Forwarded-For headers from k6 load tests
+app.set('trust proxy', true);
+
 app.use(express.json());
 
 // -------------------------------------------------------------------------
-// LIVENESS: "is the process up at all". Never checks dependencies — if this
-// fails, the orchestrator should restart the container. Keep it instant.
-// Mounted immediately (before Redis is ready) so liveness checks never
-// depend on Redis — that's what /readyz is for.
+// LIVENESS
 // -------------------------------------------------------------------------
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 
 // -------------------------------------------------------------------------
-// READINESS: "can this replica actually serve traffic right now". Checks
-// real dependencies (Postgres, Redis) with short timeouts.
+// READINESS
 // -------------------------------------------------------------------------
 app.get('/readyz', async (req, res) => {
   const checks = { postgres: false, redis: false };
@@ -48,26 +48,19 @@ app.get('/readyz', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const BACKLOG = 4096; // match net.core.somaxconn so the OS queue isn't the bottleneck
+const BACKLOG = 4096;
 
 let server;
 
 // -------------------------------------------------------------------------
-// BOOTSTRAP: waits for Redis to actually be connected BEFORE requiring the
-// route files. This matters because routes (posts/comments/likes) pull in
-// rateLimiter.js, whose RedisStore tries to load a Lua script into Redis
-// the instant it's constructed — if that happens before the client is
-// connected (and disableOfflineQueue is true in redis.js), it fails
-// immediately instead of queuing. Delaying the require() until after
-// redis.ready resolves guarantees correct ordering regardless of how fast
-// each container's Redis connection happens to complete.
+// BOOTSTRAP
 // -------------------------------------------------------------------------
 async function start() {
   try {
     await redis.ready;
   } catch (err) {
     console.error('❌ Failed to connect to Redis at startup:', err);
-    process.exit(1); // fail fast — Docker will restart the container and retry
+    process.exit(1);
   }
 
   const authRoutes = require('./routes/auth');
@@ -82,6 +75,12 @@ async function start() {
   app.use('/api/likes', likeRoutes);
   app.use('/api/follows', followRoutes);
 
+  // Global Error Handler (Logs 500 errors to terminal for debugging)
+  app.use((err, req, res, next) => {
+    console.error('🔥 Global Server Error:', err.stack || err.message || err);
+    res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  });
+
   server = app.listen(PORT, '0.0.0.0', BACKLOG, () => {
     console.log(`Server running on port ${PORT} (PID: ${process.pid}, backlog: ${BACKLOG})`);
   });
@@ -90,9 +89,7 @@ async function start() {
 start();
 
 // -------------------------------------------------------------------------
-// GRACEFUL SHUTDOWN: on SIGTERM (what Docker sends on `stop`/redeploy/scale
-// down), stop accepting NEW connections but let in-flight requests finish
-// before actually exiting.
+// GRACEFUL SHUTDOWN
 // -------------------------------------------------------------------------
 let shuttingDown = false;
 

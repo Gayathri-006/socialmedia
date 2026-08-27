@@ -13,6 +13,32 @@ const CELEBRITY_THRESHOLD = 1000;
 const CELEB_LIST_TTL = 600; // Cache followed celeb IDs for 10 minutes
 
 // =========================================================================
+// Redis hash sanitization helper
+// =========================================================================
+// node-redis's hSet only accepts string/number/Buffer values. Rows coming
+// back from pg contain real JS Date objects (timestamp columns) and can
+// contain `null` (e.g. idempotency_key when a client doesn't send one).
+// Spreading either straight into hSet throws synchronously. This was the
+// root cause of every single post-creation request 500ing in load testing,
+// 100% of the time, completely independent of load — because idempotency_key
+// is null on every request that doesn't set the Idempotency-Key header.
+function sanitizePostForRedis(row, extra = {}) {
+  return {
+    id: row.id.toString(),
+    user_id: row.user_id.toString(),
+    content: row.content,
+    username: row.username || '',
+    idempotency_key: row.idempotency_key ?? '',
+    created_at: row.created_at instanceof Date
+      ? row.created_at.toISOString()
+      : String(row.created_at),
+    likes_count: '0',
+    comments_count: '0',
+    ...extra,
+  };
+}
+
+// =========================================================================
 // FEED HYDRATION (Single Redis Hash per Post: content + stats merged)
 // =========================================================================
 async function getHydratedPosts(postIds) {
@@ -60,13 +86,11 @@ async function getHydratedPosts(postIds) {
       const hydrated = { ...row, likes_count: 0, comments_count: 0 };
       hydratedMap[idStr] = hydrated;
 
-      redisMulti.hSet(`post:${idStr}`, {
-        ...row,
-        id: row.id.toString(),
-        user_id: row.user_id.toString(),
-        likes_count: '0',
-        comments_count: '0',
-      });
+      // BUGFIX: was spreading `row` directly (Date + possible null values).
+      // This was previously failing silently on every cache-fill (masked by
+      // the .catch(() => {}) below), meaning the Redis cache for cold-missed
+      // posts never actually got populated — every miss stayed a miss forever.
+      redisMulti.hSet(`post:${idStr}`, sanitizePostForRedis(row));
       redisMulti.expire(`post:${idStr}`, POST_FRAGMENT_TTL);
     });
     await redisMulti.exec().catch(() => {});
@@ -81,7 +105,18 @@ async function getHydratedPosts(postIds) {
 // =========================================================================
 // POST CREATION ROUTE (Optimized Celebrity Tracking)
 // =========================================================================
-router.post('/', writeLimiter, authenticate, async (req, res) => {
+// BUGFIX: middleware order was `writeLimiter, authenticate`. Express runs
+// middleware left-to-right, so the rate limiter ran BEFORE authenticate
+// had a chance to set req.userId. Its keyGenerator — 
+// `req.userId ? String(req.userId) : ipKeyGenerator(req.ip)` — therefore
+// always saw req.userId as undefined and fell back to keying by IP. Since
+// every k6 VU in local load testing shares the same source IP, all 100
+// "distinct" users collapsed into ONE shared rate-limit bucket, capping
+// total successes at exactly writeLimiter's max (20) no matter how many
+// real distinct users were actually authenticated. Swapping the order so
+// authenticate runs first fixes this: req.userId is populated before the
+// limiter's keyGenerator ever runs.
+router.post('/', authenticate, writeLimiter, async (req, res) => {
   const { content } = req.body;
   if (!content) return res.status(400).json({ error: 'content required' });
 
@@ -117,14 +152,13 @@ router.post('/', writeLimiter, authenticate, async (req, res) => {
 
     const postIdStr = newPost.id.toString();
 
-    // Single hash write: content + stats together (was 2 separate commands before)
-    await redis.hSet(`post:${postIdStr}`, {
-      ...newPost,
-      id: newPost.id.toString(),
-      user_id: newPost.user_id.toString(),
-      likes_count: '0',
-      comments_count: '0',
-    });
+    // BUGFIX: was `{...newPost, id: ..., user_id: ..., likes_count: '0',
+    // comments_count: '0'}` — spread `newPost` includes created_at as a real
+    // Date object and idempotency_key as `null` on every request that
+    // doesn't send an Idempotency-Key header. node-redis's hSet throws
+    // synchronously on either, which was caught below and returned as a
+    // 500 on 100% of post-creation requests, regardless of load.
+    await redis.hSet(`post:${postIdStr}`, sanitizePostForRedis(newPost));
     await redis.expire(`post:${postIdStr}`, POST_FRAGMENT_TTL);
 
     await redis.lPush(`feed:${req.userId}`, postIdStr);
@@ -167,7 +201,9 @@ router.post('/', writeLimiter, authenticate, async (req, res) => {
 // =========================================================================
 // FEED READ ROUTE (rate-limited + circuit-breaker protected)
 // =========================================================================
-router.get('/feed', feedLimiter, authenticate, async (req, res) => {
+// BUGFIX: same middleware-order issue as above — was
+// `feedLimiter, authenticate`, now `authenticate, feedLimiter`.
+router.get('/feed', authenticate, feedLimiter, async (req, res) => {
   const feedKey = `feed:${req.userId}`;
   const statusKey = `status:${feedKey}`;
   const celebCacheKey = `user:${req.userId}:followed_celebs`;
